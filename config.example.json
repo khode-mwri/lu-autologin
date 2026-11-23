@@ -1,0 +1,6 @@
+{
+  "username": "YOUR_STUDENT_ID",
+  "password": "YOUR_PASSWORD",
+  "check_interval_seconds": 20,
+  "proactive_renew_minutes": 110
+}
