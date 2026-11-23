@@ -19,6 +19,23 @@ irm https://raw.githubusercontent.com/khode-mwri/lu-autologin/main/uninstall.ps1
 
 ---
 
+## Settings panel — just type `autologin`
+
+After install, reopen cmd and type:
+
+```
+autologin
+```
+
+A panel opens where you can:
+- Start / stop the background service
+- Enable / disable run on Windows startup
+- Switch language (فارسی / English)
+- Change username, password, check interval, renewal time
+- Test login now, diagnose the portal, view logs
+
+---
+
 ## Highlights
 - **Automatic Reconnection**: Detects when connectivity drops and logs back in.
 - **Proactive Session Renewal**: Renews the session before the university's 2-hour timeout.
@@ -46,6 +63,7 @@ If every method fails, the log (`autologin.log`) and `portal_debug.html` show ex
 
 ## Manual Usage Scripts
 Located in `$HOME\LU_AutoLogin` after install:
+- `autologin.bat`: Opens the interactive settings panel (`autologin` command).
 - `run.bat`: Runs the script with visible logs in a console window.
 - `run_background.bat`: Runs the script silently in the background.
 - `stop_background.bat`: Stops running background instances.

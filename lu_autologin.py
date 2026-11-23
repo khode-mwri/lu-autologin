@@ -30,6 +30,9 @@ Usage:
   python lu_autologin.py --diagnose    # fetch the portal, print what was
                                        # found (forms, CHAP data) and save
                                        # the HTML to portal_debug.html
+  python lu_autologin.py --panel       # interactive settings panel
+                                       # (also available as the `autologin`
+                                       # command after install)
   python lu_autologin.py --strategy chap-form --once   # force one method
 """
 
@@ -41,6 +44,9 @@ import ssl
 import re
 import socket
 import argparse
+import getpass
+import shutil
+import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -628,6 +634,332 @@ def diagnose(opener, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Interactive settings panel (`autologin` command)
+# ---------------------------------------------------------------------------
+
+PANEL_STRINGS = {
+    "fa": {
+        "title": "پنل مدیریت ورود خودکار اینترنت دانشگاه لرستان",
+        "service_running": "وضعیت سرویس: در حال اجرا",
+        "service_stopped": "وضعیت سرویس: متوقف",
+        "startup_on": "اجرای خودکار با ویندوز: فعال",
+        "startup_off": "اجرای خودکار با ویندوز: غیرفعال",
+        "startup_na": "اجرای خودکار با ویندوز: در این سیستم پشتیبانی نمی‌شود",
+        "user": "نام کاربری",
+        "strategy": "روش لاگین",
+        "strategy_none": "هنوز مشخص نشده",
+        "check_interval": "فاصله‌ی بررسی",
+        "renew": "تمدید پیشگیرانه",
+        "seconds": "ثانیه",
+        "minutes": "دقیقه",
+        "menu": "انتخاب کنید:",
+        "opt_start_service": "شروع سرویس در پس‌زمینه",
+        "opt_stop_service": "توقف سرویس",
+        "opt_toggle_startup": "فعال/غیرفعال کردن اجرای خودکار با ویندوز",
+        "opt_language": "تغییر زبان به English",
+        "opt_credentials": "تغییر نام کاربری و پسورد",
+        "opt_interval": "تغییر فاصله‌ی بررسی",
+        "opt_renew": "تغییر زمان تمدید پیشگیرانه",
+        "opt_test": "تست لاگین الان",
+        "opt_diagnose": "عیب‌یابی پورتال",
+        "opt_logs": "نمایش لاگ",
+        "opt_exit": "خروج",
+        "prompt_choice": "شماره‌ی گزینه: ",
+        "invalid_choice": "گزینه‌ی نامعتبر است.",
+        "started": "سرویس در پس‌زمینه شروع شد.",
+        "start_failed": "شروع سرویس ممکن نشد.",
+        "stopped": "سرویس متوقف شد.",
+        "stop_failed": "توقف سرویس ممکن نشد.",
+        "startup_enabled": "اجرای خودکار با ویندوز فعال شد.",
+        "startup_disabled": "اجرای خودکار با ویندوز غیرفعال شد.",
+        "startup_failed": "تغییر اجرای خودکار ممکن نشد.",
+        "lang_switched": "زبان به English تغییر کرد.",
+        "new_username": "نام کاربری جدید (خالی = بدون تغییر): ",
+        "new_password": "پسورد جدید (خالی = بدون تغییر): ",
+        "saved": "تنظیمات ذخیره شد.",
+        "new_interval": "فاصله‌ی بررسی جدید به ثانیه (الان: {v}): ",
+        "new_renew": "تمدید پیشگیرانه‌ی جدید به دقیقه (الان: {v}): ",
+        "invalid_number": "عدد معتبر وارد کنید.",
+        "not_available": "این گزینه در این سیستم در دسترس نیست.",
+        "press_enter": "برای بازگشت Enter بزنید...",
+        "goodbye": "خدانگهدار!",
+        "test_ok": "لاگین موفق بود.",
+        "test_fail": "لاگین ناموفق بود؛ لاگ را ببینید.",
+    },
+    "en": {
+        "title": "Lorestan University Auto-Login Panel",
+        "service_running": "Service status: running",
+        "service_stopped": "Service status: stopped",
+        "startup_on": "Run on Windows startup: enabled",
+        "startup_off": "Run on Windows startup: disabled",
+        "startup_na": "Run on Windows startup: not supported on this system",
+        "user": "Username",
+        "strategy": "Login method",
+        "strategy_none": "not detected yet",
+        "check_interval": "Check interval",
+        "renew": "Proactive renewal",
+        "seconds": "seconds",
+        "minutes": "minutes",
+        "menu": "Choose an option:",
+        "opt_start_service": "Start service in background",
+        "opt_stop_service": "Stop service",
+        "opt_toggle_startup": "Enable/disable run on Windows startup",
+        "opt_language": "Switch language to فارسی",
+        "opt_credentials": "Change username and password",
+        "opt_interval": "Change check interval",
+        "opt_renew": "Change proactive renewal time",
+        "opt_test": "Test login now",
+        "opt_diagnose": "Diagnose portal",
+        "opt_logs": "View logs",
+        "opt_exit": "Exit",
+        "prompt_choice": "Option number: ",
+        "invalid_choice": "Invalid option.",
+        "started": "Service started in background.",
+        "start_failed": "Could not start the service.",
+        "stopped": "Service stopped.",
+        "stop_failed": "Could not stop the service.",
+        "startup_enabled": "Run on Windows startup enabled.",
+        "startup_disabled": "Run on Windows startup disabled.",
+        "startup_failed": "Could not change the startup setting.",
+        "lang_switched": "Language switched to فارسی.",
+        "new_username": "New username (empty = no change): ",
+        "new_password": "New password (empty = no change): ",
+        "saved": "Settings saved.",
+        "new_interval": "New check interval in seconds (current: {v}): ",
+        "new_renew": "New proactive renewal in minutes (current: {v}): ",
+        "invalid_number": "Enter a valid number.",
+        "not_available": "This option is not available on this system.",
+        "press_enter": "Press Enter to go back...",
+        "goodbye": "Goodbye!",
+        "test_ok": "Login succeeded.",
+        "test_fail": "Login failed; check the log.",
+    },
+}
+
+
+def _t(cfg, key, **kw):
+    lang = cfg.get("language", "fa")
+    strings = PANEL_STRINGS.get(lang, PANEL_STRINGS["fa"])
+    s = strings.get(key, key)
+    return s.format(**kw) if kw else s
+
+
+def startup_vbs_path():
+    """Path of the .vbs file that auto-starts the service on Windows logon."""
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
+                        "Programs", "Startup", "lu_autologin.vbs")
+
+
+def is_startup_enabled():
+    p = startup_vbs_path()
+    return bool(p and os.path.exists(p))
+
+
+def set_startup(enabled):
+    """Enable/disable auto-start on Windows logon. Returns True on success."""
+    p = startup_vbs_path()
+    if not p:
+        return False
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            script = os.path.join(SCRIPT_DIR, "lu_autologin.py")
+            vbs = ('Set WshShell = CreateObject("WScript.Shell")\r\n'
+                   f'WshShell.Run "pythonw.exe ""{script}""", 0, False\r\n')
+            with open(p, "w", encoding="ascii") as f:
+                f.write(vbs)
+        else:
+            if os.path.exists(p):
+                os.remove(p)
+        return True
+    except Exception:
+        return False
+
+
+def is_service_running():
+    """True when another instance holds the single-instance lock port."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", LOCK_PORT))
+        return False
+    except socket.error:
+        return True
+    finally:
+        probe.close()
+
+
+def _pythonw_exe():
+    exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if os.path.exists(exe):
+        return exe
+    return shutil.which("pythonw") or "pythonw"
+
+
+def start_service():
+    """Start the monitor in the background (Windows only)."""
+    if os.name != "nt":
+        return False
+    try:
+        script = os.path.join(SCRIPT_DIR, "lu_autologin.py")
+        subprocess.Popen([_pythonw_exe(), script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, close_fds=True)
+        return True
+    except Exception:
+        return False
+
+
+def stop_service():
+    """Stop a running background monitor (Windows only)."""
+    if os.name != "nt":
+        return False
+    try:
+        cmd = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pythonw.exe' "
+               "-and $_.CommandLine -like '*lu_autologin.py*' } | "
+               "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+        subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                       capture_output=True, timeout=30)
+        time.sleep(1)
+        return not is_service_running()
+    except Exception:
+        return False
+
+
+def open_logs():
+    """Open the log file in Notepad (Windows) or print its path."""
+    if os.name == "nt" and os.path.exists(LOG_FILE):
+        try:
+            subprocess.Popen(["notepad.exe", LOG_FILE])
+            return True
+        except Exception:
+            return False
+    print(LOG_FILE)
+    return False
+
+
+def _pause(cfg):
+    try:
+        input(_t(cfg, "press_enter"))
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
+def run_panel(cfg, config_file):
+    """Interactive settings panel. Returns an exit code."""
+    while True:
+        print("=" * 65)
+        print("  " + _t(cfg, "title"))
+        print("=" * 65)
+        running = is_service_running()
+        print(_t(cfg, "service_running" if running else "service_stopped"))
+        if startup_vbs_path() is None:
+            print(_t(cfg, "startup_na"))
+        else:
+            print(_t(cfg, "startup_on" if is_startup_enabled() else "startup_off"))
+        print(f"{_t(cfg, 'user')}: {cfg.get('username', '-')}")
+        print(f"{_t(cfg, 'strategy')}: {cfg.get('strategy') or _t(cfg, 'strategy_none')}")
+        print(f"{_t(cfg, 'check_interval')}: {cfg.get('check_interval_seconds', 20)} {_t(cfg, 'seconds')}")
+        print(f"{_t(cfg, 'renew')}: {cfg.get('proactive_renew_minutes', 110)} {_t(cfg, 'minutes')}")
+        print("-" * 65)
+        print(_t(cfg, "menu"))
+        print(f"  1. {_t(cfg, 'opt_stop_service' if running else 'opt_start_service')}")
+        print(f"  2. {_t(cfg, 'opt_toggle_startup')}")
+        print(f"  3. {_t(cfg, 'opt_language')}")
+        print(f"  4. {_t(cfg, 'opt_credentials')}")
+        print(f"  5. {_t(cfg, 'opt_interval')}")
+        print(f"  6. {_t(cfg, 'opt_renew')}")
+        print(f"  7. {_t(cfg, 'opt_test')}")
+        print(f"  8. {_t(cfg, 'opt_diagnose')}")
+        print(f"  9. {_t(cfg, 'opt_logs')}")
+        print(f"  0. {_t(cfg, 'opt_exit')}")
+        try:
+            choice = input(_t(cfg, "prompt_choice")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(_t(cfg, "goodbye"))
+            return 0
+
+        if choice == "0":
+            print(_t(cfg, "goodbye"))
+            return 0
+        elif choice == "1":
+            if running:
+                print(_t(cfg, "stopped" if stop_service() else "stop_failed"))
+            else:
+                print(_t(cfg, "started" if start_service() else "start_failed"))
+        elif choice == "2":
+            target = not is_startup_enabled()
+            ok = set_startup(target)
+            if ok:
+                print(_t(cfg, "startup_enabled" if target else "startup_disabled"))
+            else:
+                print(_t(cfg, "startup_failed"))
+        elif choice == "3":
+            cfg["language"] = "en" if cfg.get("language", "fa") == "fa" else "fa"
+            save_config(cfg, config_file)
+            print(_t(cfg, "lang_switched"))
+        elif choice == "4":
+            try:
+                new_user = input(_t(cfg, "new_username")).strip()
+                new_pass = getpass.getpass(_t(cfg, "new_password")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if new_user:
+                cfg["username"] = new_user
+            if new_pass:
+                cfg["password"] = new_pass
+            save_config(cfg, config_file)
+            print(_t(cfg, "saved"))
+        elif choice == "5":
+            try:
+                v = input(_t(cfg, "new_interval",
+                             v=cfg.get("check_interval_seconds", 20))).strip()
+                n = int(v)
+                if not 5 <= n <= 3600:
+                    raise ValueError
+                cfg["check_interval_seconds"] = n
+                save_config(cfg, config_file)
+                print(_t(cfg, "saved"))
+            except (ValueError, EOFError, KeyboardInterrupt):
+                print()
+                print(_t(cfg, "invalid_number"))
+        elif choice == "6":
+            try:
+                v = input(_t(cfg, "new_renew",
+                             v=cfg.get("proactive_renew_minutes", 110))).strip()
+                n = int(v)
+                if not 1 <= n <= 600:
+                    raise ValueError
+                cfg["proactive_renew_minutes"] = n
+                save_config(cfg, config_file)
+                print(_t(cfg, "saved"))
+            except (ValueError, EOFError, KeyboardInterrupt):
+                print()
+                print(_t(cfg, "invalid_number"))
+        elif choice == "7":
+            opener = create_session()
+            ok, _ = perform_login(opener, cfg, config_file)
+            print(_t(cfg, "test_ok" if ok else "test_fail"))
+            _pause(cfg)
+        elif choice == "8":
+            opener = create_session()
+            diagnose(opener, cfg)
+            _pause(cfg)
+        elif choice == "9":
+            if not open_logs():
+                print(_t(cfg, "not_available"))
+            _pause(cfg)
+        else:
+            print(_t(cfg, "invalid_choice"))
+        print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Monitor loop
 # ---------------------------------------------------------------------------
 
@@ -702,6 +1034,9 @@ def main():
     parser.add_argument("--diagnose", action="store_true",
                         help="Fetch the portal, print detected forms/CHAP data, "
                              "save the HTML to portal_debug.html, then exit.")
+    parser.add_argument("--panel", action="store_true",
+                        help="Open the interactive settings panel "
+                             "(also available as the `autologin` command).")
     parser.add_argument("--strategy", choices=[n for n, _ in STRATEGIES],
                         help="Force a single login method (for testing).")
     parser.add_argument("--config", default=DEFAULT_CONFIG_FILE,
@@ -713,6 +1048,9 @@ def main():
 
     if args.diagnose:
         return diagnose(opener, cfg)
+
+    if args.panel:
+        return run_panel(cfg, args.config)
 
     if not cfg.get("username") or not cfg.get("password"):
         print("[ERROR] No credentials configured. Run once without --diagnose "

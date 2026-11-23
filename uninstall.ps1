@@ -20,4 +20,12 @@ if (Test-Path $installDir) {
     Write-Host "[OK] Removed installation directory: $installDir" -ForegroundColor Green
 }
 
+# Remove the installation directory from the user PATH (best effort).
+$currentPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($currentPath -and $currentPath.Contains($installDir)) {
+    $newPath = ($currentPath -split ';' | Where-Object { $_ -ne $installDir -and $_ -ne '' }) -join ';'
+    [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    Write-Host "[OK] Removed installation directory from PATH." -ForegroundColor Green
+}
+
 Write-Host "[OK] Lorestan University Auto-Login has been completely removed." -ForegroundColor Green
