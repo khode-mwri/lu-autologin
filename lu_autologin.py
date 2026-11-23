@@ -849,6 +849,9 @@ def _pause(cfg):
 
 def run_panel(cfg, config_file):
     """Interactive settings panel. Returns an exit code."""
+    if os.name == "nt":
+        # UTF-8 code page so Persian text displays correctly in the console.
+        os.system("chcp 65001 >nul")
     while True:
         print("=" * 65)
         print("  " + _t(cfg, "title"))
