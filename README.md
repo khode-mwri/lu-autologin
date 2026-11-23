@@ -37,6 +37,7 @@ autologin
 - سرویس را در پس‌زمینه شروع / متوقف کنید
 - اجرای خودکار با ویندوز را فعال / غیرفعال کنید
 - زبان را عوض کنید (فارسی / English)
+- پنل همیشه به فارسی باز می‌شود
 - نام کاربری، پسورد، فاصله‌ی بررسی و زمان تمدید را تغییر دهید
 - همین حالا لاگین را تست کنید، پورتال را عیب‌یابی کنید و لاگ را ببینید
 - به‌روزرسانی را بررسی کنید
@@ -135,6 +136,7 @@ A panel opens where you can:
 - Start / stop the background service
 - Enable / disable run on Windows startup
 - Switch language (فارسی / English)
+- The panel always opens in Persian
 - Change username, password, check interval, renewal time
 - Test login now, diagnose the portal, view logs
 - Check for updates

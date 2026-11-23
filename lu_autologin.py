@@ -90,7 +90,7 @@ STRATEGY_NAMES = ["chap-form", "plain-form", "plain-page", "chap-page", "get-log
 
 # Release version. Bump together with version.txt on every release push;
 # the self-update check compares this against version.txt on GitHub.
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com/khode-mwri/lu-autologin/main"
 VERSION_URL = GITHUB_RAW_BASE + "/version.txt"
@@ -1000,6 +1000,9 @@ def run_panel(cfg, config_file):
     if os.name == "nt":
         # UTF-8 code page so Persian text displays correctly in the console.
         os.system("chcp 65001 >nul")
+    # The panel always opens in Persian by default; option 3 switches the
+    # language for this session.
+    cfg["language"] = "fa"
     while True:
         print("=" * 65)
         print("  " + _t(cfg, "title"))
