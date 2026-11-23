@@ -6,6 +6,10 @@ config.json
 autologin.log
 portal_debug.html
 
+# Self-update leftovers
+*.bak
+.update/
+
 # Python bytecode & cache
 __pycache__/
 *.py[cod]

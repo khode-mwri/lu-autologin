@@ -43,6 +43,7 @@ def main():
         ("menu shown in English after switch", "Choose an option:" in out),
         ("goodbye in English", "Goodbye!" in out),
         ("startup shown as unsupported here", "not supported on this system" in out),
+        ("version shown in header", "1.3.0" in out),
     ]
     failed = 0
     for name, ok in checks:

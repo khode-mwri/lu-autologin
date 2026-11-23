@@ -8,15 +8,31 @@ Write-Host "  Lorestan University (LU) Auto-Login Installer" -ForegroundColor Cy
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# 1. Verify Python availability
+# 1. Verify Python availability (install it automatically if missing)
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 $pythonwCmd = Get-Command pythonw -ErrorAction SilentlyContinue
 
 if (-not $pythonCmd -or -not $pythonwCmd) {
-    Write-Host "[ERROR] Python was not found on this system." -ForegroundColor Red
-    Write-Host "Please install Python 3 from https://www.python.org/downloads/ or Microsoft Store." -ForegroundColor Yellow
-    Write-Host "Remember to check 'Add Python to PATH' during installation." -ForegroundColor Yellow
-    return
+    Write-Host "Python was not found. Trying to install it automatically..." -ForegroundColor Yellow
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        try {
+            winget install Python.Python.3 --accept-source-agreements --accept-package-agreements --silent
+        } catch {
+            Write-Host "[ERROR] Automatic Python install failed." -ForegroundColor Red
+        }
+        # Refresh PATH for this session so the new Python is found.
+        $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+        $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+        $pythonwCmd = Get-Command pythonw -ErrorAction SilentlyContinue
+    }
+    if (-not $pythonCmd -or -not $pythonwCmd) {
+        Write-Host "[ERROR] Python was not found on this system." -ForegroundColor Red
+        Write-Host "Please install Python 3 from https://www.python.org/downloads/ or Microsoft Store." -ForegroundColor Yellow
+        Write-Host "Remember to check 'Add Python to PATH' during installation." -ForegroundColor Yellow
+        return
+    }
+    Write-Host "[OK] Python installed." -ForegroundColor Green
 }
 
 # 2. Installation directory
@@ -44,7 +60,7 @@ if ([string]::IsNullOrWhiteSpace($plainPassword)) {
 # 4. Fetch latest project files from GitHub
 Write-Host "`nDownloading latest files from repository..." -ForegroundColor Cyan
 $baseUrl = "https://raw.githubusercontent.com/khode-mwri/lu-autologin/main"
-$files = @("lu_autologin.py", "autologin.bat", "run.bat", "run_background.bat", "stop_background.bat", "enable_startup.bat", "disable_startup.bat", "view_logs.bat", "setup.bat", "launch_silent.vbs", "README.md")
+$files = @("lu_autologin.py", "autologin.bat", "run.bat", "run_background.bat", "stop_background.bat", "enable_startup.bat", "disable_startup.bat", "view_logs.bat", "setup.bat", "launch_silent.vbs", "README.md", "version.txt")
 
 foreach ($f in $files) {
     $url = "$baseUrl/$f"
@@ -72,6 +88,19 @@ $startupVbs = Join-Path $startupFolder "lu_autologin.vbs"
 $vbsContent = "Set WshShell = CreateObject(`"WScript.Shell`")`nWshShell.Run `"pythonw.exe `"`"$installDir\lu_autologin.py`"`", 0, False"
 [System.IO.File]::WriteAllText($startupVbs, $vbsContent, [System.Text.Encoding]::ASCII)
 
+# 7. Install tray icon support (best effort; the core works without it)
+Write-Host "Installing tray icon support (pystray)..." -ForegroundColor Cyan
+python -m pip --version > $null 2>&1
+if ($LASTEXITCODE -ne 0) {
+    python -m ensurepip --default-pip > $null 2>&1
+}
+python -m pip install --quiet --disable-pip-version-check pystray pillow
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "[OK] Tray icon support installed." -ForegroundColor Green
+} else {
+    Write-Host "[WARNING] Could not install pystray; the tray icon and notifications will be unavailable, but auto-login still works." -ForegroundColor Yellow
+}
+
 # 8. Add installation directory to user PATH so `autologin` works from any cmd window
 $currentPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($currentPath -and -not $currentPath.Contains($installDir)) {
@@ -91,6 +120,7 @@ Start-Process "pythonw.exe" -ArgumentList "`"$installDir\lu_autologin.py`"" -Win
 Write-Host ""
 Write-Host "[OK] Installation completed successfully!" -ForegroundColor Green
 Write-Host "[OK] Service is now running silently in the background." -ForegroundColor Green
+Write-Host "[OK] Tray icon is next to the clock (green = connected, red = offline)." -ForegroundColor Green
 Write-Host "[OK] Added to Windows Startup (auto-runs on system boot)." -ForegroundColor Green
 Write-Host "Directory: $installDir" -ForegroundColor Gray
 Write-Host "Reopen cmd and type: autologin   (opens the settings panel)" -ForegroundColor Cyan

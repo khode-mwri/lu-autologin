@@ -25,7 +25,8 @@ Strategies (tried in this order, remembered winner first):
   get-login   - Username/password sent as a GET query to the form action.
 
 Usage:
-  python lu_autologin.py               # monitor loop (default)
+  python lu_autologin.py               # monitor loop (default; on Windows
+                                       # shows a tray icon next to the clock)
   python lu_autologin.py --once        # try to log in once, then exit
   python lu_autologin.py --diagnose    # fetch the portal, print what was
                                        # found (forms, CHAP data) and save
@@ -33,6 +34,7 @@ Usage:
   python lu_autologin.py --panel       # interactive settings panel
                                        # (also available as the `autologin`
                                        # command after install)
+  python lu_autologin.py --no-tray     # monitor loop without the tray icon
   python lu_autologin.py --strategy chap-form --once   # force one method
 """
 
@@ -47,11 +49,13 @@ import argparse
 import getpass
 import shutil
 import subprocess
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
 import http.cookiejar
 import hashlib
+import py_compile
 from datetime import datetime
 
 # Configure standard streams for safety on Windows
@@ -84,6 +88,22 @@ DEFAULT_CONNECTIVITY_URLS = [
 
 STRATEGY_NAMES = ["chap-form", "plain-form", "plain-page", "chap-page", "get-login"]
 
+# Release version. Bump together with version.txt on every release push;
+# the self-update check compares this against version.txt on GitHub.
+__version__ = "1.3.0"
+
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/khode-mwri/lu-autologin/main"
+VERSION_URL = GITHUB_RAW_BASE + "/version.txt"
+
+# Files the self-updater refreshes from GitHub (never config.json).
+UPDATE_FILES = [
+    "lu_autologin.py", "autologin.bat", "run.bat", "run_background.bat",
+    "stop_background.bat", "enable_startup.bat", "disable_startup.bat",
+    "view_logs.bat", "setup.bat", "launch_silent.vbs",
+]
+UPDATE_CHECK_INTERVAL_SECONDS = 6 * 3600
+NOTIFY_AFTER_FAILURES = 3
+
 
 def ensure_single_instance():
     """Ensure only one instance of the auto-login service runs at a time."""
@@ -108,6 +128,7 @@ def load_config(config_file, interactive=True):
 
     cfg.setdefault("check_interval_seconds", 20)
     cfg.setdefault("proactive_renew_minutes", 110)
+    cfg.setdefault("auto_update", True)
     cfg.setdefault("portal_urls", list(DEFAULT_PORTAL_URLS))
     cfg.setdefault("connectivity_urls", list(DEFAULT_CONNECTIVITY_URLS))
 
@@ -634,6 +655,105 @@ def diagnose(opener, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Self-update
+# ---------------------------------------------------------------------------
+
+def parse_version(text):
+    """'1.3.0' -> (1, 3, 0). Tolerates whitespace and missing parts."""
+    parts = []
+    for piece in str(text or "").strip().split("."):
+        piece = piece.strip()
+        if piece.isdigit():
+            parts.append(int(piece))
+        else:
+            break
+    return tuple(parts) if parts else (0,)
+
+
+def fetch_remote_version(url=VERSION_URL, timeout=10):
+    """Return the version string from version.txt on GitHub, or None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "lu-autologin"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", "replace").strip()
+    except Exception as e:
+        log(f"Update check failed: {e}", "WARNING")
+        return None
+
+
+def check_for_update(url=VERSION_URL):
+    """Return (available, remote_version). available is True when the remote
+    version is newer than this script's __version__."""
+    remote = fetch_remote_version(url)
+    if not remote:
+        return False, None
+    return parse_version(remote) > parse_version(__version__), remote
+
+
+def _download_file(url, dest_path, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": "lu-autologin"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    with open(dest_path, "wb") as f:
+        f.write(data)
+    return dest_path
+
+
+def _version_in_file(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', f.read(), re.M)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def download_update_files(remote_version, dest_dir=SCRIPT_DIR, base_url=GITHUB_RAW_BASE):
+    """Download the update set into dest_dir/.update, verify it, then move it
+    into place (keeping a .bak copy of each replaced file). Returns True on
+    success; on any failure the live files are left untouched."""
+    tmp_dir = os.path.join(dest_dir, ".update")
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        staged = []
+        for name in UPDATE_FILES:
+            staged_path = os.path.join(tmp_dir, name)
+            _download_file(f"{base_url}/{name}", staged_path)
+            staged.append((name, staged_path))
+        # Verify the new script before touching anything live.
+        script_path = os.path.join(tmp_dir, "lu_autologin.py")
+        py_compile.compile(script_path, doraise=True)
+        if _version_in_file(script_path) != remote_version:
+            log("Downloaded script version does not match version.txt; aborting update.", "ERROR")
+            return False
+        for name, staged_path in staged:
+            target = os.path.join(dest_dir, name)
+            if os.path.exists(target):
+                shutil.copy2(target, target + ".bak")
+            os.replace(staged_path, target)
+        return True
+    except Exception as e:
+        log(f"Update download failed: {e}", "ERROR")
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def apply_update(remote_version=None, dest_dir=SCRIPT_DIR, base_url=GITHUB_RAW_BASE):
+    """Check for an update and apply it if one is available.
+    Returns (updated, remote_version)."""
+    if remote_version is None:
+        available, remote_version = check_for_update()
+        if not available:
+            return False, remote_version
+    log(f"Updating to version {remote_version}...", "INFO")
+    if download_update_files(remote_version, dest_dir, base_url):
+        log(f"Updated to version {remote_version}.", "SUCCESS")
+        return True, remote_version
+    return False, remote_version
+
+
+# ---------------------------------------------------------------------------
 # Interactive settings panel (`autologin` command)
 # ---------------------------------------------------------------------------
 
@@ -685,6 +805,20 @@ PANEL_STRINGS = {
         "goodbye": "خدانگهدار!",
         "test_ok": "لاگین موفق بود.",
         "test_fail": "لاگین ناموفق بود؛ لاگ را ببینید.",
+        "version": "نسخه",
+        "opt_update": "بررسی به‌روزرسانی",
+        "update_available": "نسخه‌ی جدید {v} موجود است.",
+        "update_prompt": "به‌روز شود؟ (y/n): ",
+        "update_done": "به‌روز شد.",
+        "update_failed": "به‌روزرسانی ناموفق بود.",
+        "update_check_failed": "بررسی به‌روزرسانی ممکن نشد.",
+        "up_to_date": "به‌روز هستید.",
+        "notif_title": "ورود خودکار دانشگاه لرستان",
+        "notif_failed": "لاگین ناموفق بود؛ اینترنت قطع است.",
+        "notif_recovered": "اینترنت وصل شد.",
+        "tray_online": "متصل",
+        "tray_offline": "قطع",
+        "tray_starting": "در حال شروع...",
     },
     "en": {
         "title": "Lorestan University Auto-Login Panel",
@@ -733,6 +867,20 @@ PANEL_STRINGS = {
         "goodbye": "Goodbye!",
         "test_ok": "Login succeeded.",
         "test_fail": "Login failed; check the log.",
+        "version": "Version",
+        "opt_update": "Check for updates",
+        "update_available": "New version {v} is available.",
+        "update_prompt": "Update now? (y/n): ",
+        "update_done": "Updated.",
+        "update_failed": "Update failed.",
+        "update_check_failed": "Could not check for updates.",
+        "up_to_date": "You are up to date.",
+        "notif_title": "LU Auto-Login",
+        "notif_failed": "Login failed; the internet is down.",
+        "notif_recovered": "Internet is back.",
+        "tray_online": "Connected",
+        "tray_offline": "Offline",
+        "tray_starting": "Starting...",
     },
 }
 
@@ -866,6 +1014,7 @@ def run_panel(cfg, config_file):
         print(f"{_t(cfg, 'strategy')}: {cfg.get('strategy') or _t(cfg, 'strategy_none')}")
         print(f"{_t(cfg, 'check_interval')}: {cfg.get('check_interval_seconds', 20)} {_t(cfg, 'seconds')}")
         print(f"{_t(cfg, 'renew')}: {cfg.get('proactive_renew_minutes', 110)} {_t(cfg, 'minutes')}")
+        print(f"{_t(cfg, 'version')}: {__version__}")
         print("-" * 65)
         print(_t(cfg, "menu"))
         print(f"  1. {_t(cfg, 'opt_stop_service' if running else 'opt_start_service')}")
@@ -877,6 +1026,7 @@ def run_panel(cfg, config_file):
         print(f"  7. {_t(cfg, 'opt_test')}")
         print(f"  8. {_t(cfg, 'opt_diagnose')}")
         print(f"  9. {_t(cfg, 'opt_logs')}")
+        print(f" 10. {_t(cfg, 'opt_update')}")
         print(f"  0. {_t(cfg, 'opt_exit')}")
         try:
             choice = input(_t(cfg, "prompt_choice")).strip()
@@ -956,6 +1106,30 @@ def run_panel(cfg, config_file):
             if not open_logs():
                 print(_t(cfg, "not_available"))
             _pause(cfg)
+        elif choice == "10":
+            available, remote = check_for_update()
+            if remote is None:
+                print(_t(cfg, "update_check_failed"))
+            elif not available:
+                print(_t(cfg, "up_to_date"))
+            else:
+                print(_t(cfg, "update_available", v=remote))
+                try:
+                    ans = input(_t(cfg, "update_prompt")).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+                if ans in ("y", "yes", "بله"):
+                    ok, _ = apply_update(remote)
+                    if ok:
+                        print(_t(cfg, "update_done"))
+                        if is_service_running():
+                            stop_service()
+                            time.sleep(1)
+                            start_service()
+                    else:
+                        print(_t(cfg, "update_failed"))
+            _pause(cfg)
         else:
             print(_t(cfg, "invalid_choice"))
         print()
@@ -963,10 +1137,187 @@ def run_panel(cfg, config_file):
 
 
 # ---------------------------------------------------------------------------
+# System tray icon + notifications (Windows, pystray is optional)
+# ---------------------------------------------------------------------------
+
+try:
+    import pystray
+    _PYSTRAY_AVAILABLE = True
+except Exception:
+    pystray = None
+    _PYSTRAY_AVAILABLE = False
+
+try:
+    from PIL import Image, ImageDraw
+    _PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    ImageDraw = None
+    _PIL_AVAILABLE = False
+
+TRAY_COLORS = {
+    "starting": (156, 163, 175),   # gray
+    "online": (34, 197, 94),       # green
+    "offline": (239, 68, 68),      # red
+}
+
+
+def _tray_image(status):
+    """64x64 tray icon: a Wi-Fi-like symbol in the status color."""
+    if not _PIL_AVAILABLE:
+        return None
+    color = TRAY_COLORS.get(status, TRAY_COLORS["starting"])
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([2, 2, 62, 62], radius=14, fill=color + (255,))
+    d.arc([16, 22, 48, 54], 200, 340, fill="white", width=4)
+    d.arc([22, 30, 42, 50], 200, 340, fill="white", width=4)
+    d.ellipse([29, 42, 35, 48], fill="white")
+    return img
+
+
+def notify(control, message, title=None):
+    """Show a tray notification (toast). Falls back to the log when no
+    tray icon is running."""
+    icon = control.get("icon") if control else None
+    if icon is not None:
+        try:
+            icon.notify(message, title or "LU Auto-Login")
+            return True
+        except Exception:
+            pass
+    log(f"{title + ': ' if title else ''}{message}", "INFO")
+    return False
+
+
+def build_tray_menu(cfg, control):
+    """Fresh tray menu (rebuilt whenever the status text changes)."""
+    lang = cfg.get("language", "fa")
+    if lang == "fa":
+        status_label = control.get("status_text") or "در حال شروع..."
+        login_now = "لاگین الان"
+        open_panel = "باز کردن پنل"
+        check_update = "بررسی به‌روزرسانی"
+        quit_label = "خروج"
+    else:
+        status_label = control.get("status_text") or "Starting..."
+        login_now = "Login now"
+        open_panel = "Open panel"
+        check_update = "Check for updates"
+        quit_label = "Quit"
+
+    def _login_now(icon, item):
+        control["wake_event"].set()
+
+    def _open_panel(icon, item):
+        try:
+            bat = os.path.join(SCRIPT_DIR, "autologin.bat")
+            if hasattr(os, "startfile"):
+                os.startfile(bat)
+            else:
+                subprocess.Popen(["cmd", "/c", "start", "", bat])
+        except Exception as e:
+            log(f"Could not open panel from tray: {e}", "ERROR")
+
+    def _check_update(icon, item):
+        def _run():
+            cfg = control["cfg"]
+            available, remote = check_for_update()
+            if remote is None:
+                notify(control, _t(cfg, "update_check_failed"), _t(cfg, "notif_title"))
+            elif available:
+                ok, _ = apply_update(remote)
+                if ok:
+                    notify(control, _t(cfg, "update_done"), _t(cfg, "notif_title"))
+                    request_restart(control)
+                else:
+                    notify(control, _t(cfg, "update_failed"), _t(cfg, "notif_title"))
+            else:
+                notify(control, _t(cfg, "up_to_date"), _t(cfg, "notif_title"))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _quit(icon, item):
+        control["stop_event"].set()
+        icon.stop()
+
+    return pystray.Menu(
+        pystray.MenuItem(status_label, None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(login_now, _login_now),
+        pystray.MenuItem(open_panel, _open_panel),
+        pystray.MenuItem(check_update, _check_update),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(quit_label, _quit),
+    )
+
+
+def set_tray_status(control, status, status_text):
+    control["status"] = status
+    control["status_text"] = status_text
+    icon = control.get("icon")
+    if icon is None:
+        return
+    try:
+        img = _tray_image(status)
+        if img is not None:
+            icon.icon = img
+        icon.title = f"LU Auto-Login — {status_text}"
+        icon.menu = build_tray_menu(control["cfg"], control)
+        icon.update_menu()
+    except Exception:
+        pass
+
+
+def create_tray(cfg, control):
+    """Build the tray icon (Windows only, pystray optional). Returns the
+    pystray Icon, or None when the tray is unavailable."""
+    if os.name != "nt" or not _PYSTRAY_AVAILABLE:
+        if os.name == "nt":
+            log("pystray is not installed; tray icon and notifications are "
+                "unavailable. Run: python -m pip install pystray pillow",
+                "WARNING")
+        return None
+    try:
+        menu = build_tray_menu(cfg, control)
+        icon = pystray.Icon("lu-autologin", _tray_image("starting"),
+                            "LU Auto-Login", menu)
+        control["icon"] = icon
+        return icon
+    except Exception as e:
+        log(f"Could not start tray icon: {e}", "WARNING")
+        return None
+
+
+def spawn_new_process():
+    script = os.path.join(SCRIPT_DIR, "lu_autologin.py")
+    subprocess.Popen([sys.executable, script] + sys.argv[1:])
+
+
+def request_restart(control):
+    """Restart the process with the same arguments (used after an update).
+    With a tray running, stop the tray first so the main thread can restart
+    cleanly; without a tray, spawn the new process and exit immediately."""
+    if control is None:
+        spawn_new_process()
+        os._exit(0)
+    control["restart_requested"] = True
+    icon = control.get("icon")
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception:
+            pass
+    else:
+        spawn_new_process()
+        os._exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Monitor loop
 # ---------------------------------------------------------------------------
 
-def run_monitor(cfg, config_file, once=False, force_strategy=None):
+def run_monitor(cfg, config_file, once=False, force_strategy=None,
+                stop_event=None, wake_event=None, control=None):
     username = cfg["username"]
     password = cfg["password"]
     check_interval = int(cfg.get("check_interval_seconds", 20))
@@ -981,6 +1332,7 @@ def run_monitor(cfg, config_file, once=False, force_strategy=None):
     log(f"Target Portal       : {portal_urls[0]}", "INFO")
     log(f"Check Frequency     : Every {check_interval} seconds", "INFO")
     log(f"Proactive Renewal   : Every {proactive_seconds // 60} minutes", "INFO")
+    log(f"Version             : {__version__}", "INFO")
     if cfg.get("strategy"):
         log(f"Preferred Method    : {cfg['strategy']} (remembered)", "INFO")
     print("=" * 65)
@@ -988,44 +1340,98 @@ def run_monitor(cfg, config_file, once=False, force_strategy=None):
     opener = create_session()
     connectivity_urls = cfg.get("connectivity_urls") or list(DEFAULT_CONNECTIVITY_URLS)
     last_login_time = 0
+    fail_streak = 0
+    last_update_check = 0
+
+    def _online():
+        if control is not None:
+            set_tray_status(control, "online", _t(cfg, "tray_online"))
+
+    def _offline():
+        if control is not None:
+            set_tray_status(control, "offline", _t(cfg, "tray_offline"))
+
+    def _note_failed():
+        if fail_streak == NOTIFY_AFTER_FAILURES and control is not None:
+            notify(control, _t(cfg, "notif_failed"), _t(cfg, "notif_title"))
 
     if check_internet(connectivity_urls):
         log("Internet is currently ACTIVE.", "INFO")
         last_login_time = time.time()
+        _online()
     else:
         log("Internet is DOWN. Attempting initial login...", "WARNING")
+        _offline()
         ok, _ = perform_login(opener, cfg, config_file, force_strategy)
         if ok:
             last_login_time = time.time()
+            _online()
+        else:
+            fail_streak = 1
 
     if once:
         return 0 if last_login_time > 0 else 1
 
-    while True:
+    if stop_event is None:
+        stop_event = threading.Event()
+    if wake_event is None:
+        wake_event = threading.Event()
+
+    while not stop_event.is_set():
         try:
-            time.sleep(check_interval)
+            # Wake early for "Login now" from the tray, or wait the interval.
+            wake_event.wait(check_interval)
+            wake_event.clear()
+            if stop_event.is_set():
+                break
             now = time.time()
+
+            # Periodic self-update check.
+            if cfg.get("auto_update", True) and (now - last_update_check) >= UPDATE_CHECK_INTERVAL_SECONDS:
+                last_update_check = now
+                available, remote = check_for_update()
+                if available:
+                    ok, _ = apply_update(remote)
+                    if ok:
+                        request_restart(control)
+                        break
 
             if last_login_time > 0 and (now - last_login_time) >= proactive_seconds:
                 log("Proactive session renewal window reached. Refreshing session...", "INFO")
                 if perform_login(opener, cfg, config_file, force_strategy)[0]:
                     last_login_time = now
+                    fail_streak = 0
+                    _online()
+                else:
+                    fail_streak += 1
+                    _offline()
+                    _note_failed()
                 continue
 
             if not check_internet(connectivity_urls):
                 log("Internet disconnected! Reconnecting...", "WARNING")
+                _offline()
                 if perform_login(opener, cfg, config_file, force_strategy)[0]:
                     last_login_time = now
+                    if fail_streak >= 1 and control is not None:
+                        notify(control, _t(cfg, "notif_recovered"), _t(cfg, "notif_title"))
+                    fail_streak = 0
+                    _online()
                     log("Connection restored successfully.", "SUCCESS")
                 else:
+                    fail_streak += 1
+                    _note_failed()
                     log("Retry scheduled in next cycle...", "INFO")
+            else:
+                fail_streak = 0
+                _online()
 
         except KeyboardInterrupt:
             log("Service stopped by user.", "INFO")
             break
         except Exception as ex:
             log(f"Unexpected error: {ex}", "ERROR")
-            time.sleep(5)
+            stop_event.wait(5)
     return 0
 
 
@@ -1040,6 +1446,8 @@ def main():
     parser.add_argument("--panel", action="store_true",
                         help="Open the interactive settings panel "
                              "(also available as the `autologin` command).")
+    parser.add_argument("--no-tray", action="store_true",
+                        help="Disable the system tray icon (Windows).")
     parser.add_argument("--strategy", choices=[n for n, _ in STRATEGIES],
                         help="Force a single login method (for testing).")
     parser.add_argument("--config", default=DEFAULT_CONFIG_FILE,
@@ -1060,11 +1468,50 @@ def main():
               "to enter them, or fill in config.json.")
         return 1
 
-    if not args.once:
-        ensure_single_instance()
+    if args.once:
+        return run_monitor(cfg, args.config, once=True,
+                           force_strategy=args.strategy)
 
-    return run_monitor(cfg, args.config, once=args.once,
-                       force_strategy=args.strategy)
+    ensure_single_instance()
+
+    stop_event = threading.Event()
+    wake_event = threading.Event()
+    control = {
+        "cfg": cfg,
+        "status": "starting",
+        "status_text": _t(cfg, "tray_starting"),
+        "icon": None,
+        "restart_requested": False,
+        "stop_event": stop_event,
+        "wake_event": wake_event,
+    }
+
+    tray = None if args.no_tray else create_tray(cfg, control)
+
+    monitor_thread = threading.Thread(
+        target=run_monitor,
+        args=(cfg, args.config),
+        kwargs={"force_strategy": args.strategy,
+                "stop_event": stop_event,
+                "wake_event": wake_event,
+                "control": control},
+        daemon=True)
+    monitor_thread.start()
+
+    if tray is not None:
+        tray.run()  # blocks until the icon is stopped (Quit or restart)
+        if control.get("restart_requested"):
+            spawn_new_process()
+        return 0
+
+    # No tray: wait for the monitor thread (it restarts itself after updates).
+    try:
+        while monitor_thread.is_alive():
+            monitor_thread.join(timeout=1)
+    except KeyboardInterrupt:
+        stop_event.set()
+        monitor_thread.join(timeout=5)
+    return 0
 
 
 if __name__ == "__main__":

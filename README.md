@@ -39,6 +39,7 @@ autologin
 - زبان را عوض کنید (فارسی / English)
 - نام کاربری، پسورد، فاصله‌ی بررسی و زمان تمدید را تغییر دهید
 - همین حالا لاگین را تست کنید، پورتال را عیب‌یابی کنید و لاگ را ببینید
+- به‌روزرسانی را بررسی کنید
 
 **نکته درباره‌ی نمایش فارسی در ترمینال:** متن فارسی در Windows Terminal راست‌چین و به‌هم‌پیوسته نمایش داده می‌شود. در cmd قدیمی ممکن است حروف جدا یا جابه‌جا دیده شوند؛ در این صورت از Windows Terminal استفاده کنید یا از داخل پنل زبان را به English تغییر دهید.
 
@@ -50,6 +51,9 @@ autologin
 - **اجرای پس‌زمینه:** بدون اینکه پنجره‌ی ترمینالی باز بماند کار می‌کند.
 - **مستقل از مرورگر:** مستقیم با نقطه‌ی ورود لاگین کار می‌کند و به مرورگر نیازی ندارد.
 - **یکپارچه با استارتاپ ویندوز:** با روشن شدن سیستم، بی‌صدا اجرا می‌شود.
+- **آیکون سینی ویندوز:** آیکون کوچکی کنار ساعت وضعیت را نشان می‌دهد (سبز = متصل، قرمز = قطع) و با کلیک راست می‌توانید لاگین، پنل یا خروج را بزنید.
+- **اعلان:** اگر چند بار پشت سر هم لاگین نشد، ویندوز به شما خبر می‌دهد؛ وقتی دوباره وصل شد هم خبر می‌دهد.
+- **به‌روزرسانی خودکار:** اسکریپت هر چند ساعت گیت‌هاب را چک می‌کند و اگر نسخه‌ی جدید آمد، خودش را به‌روز می‌کند.
 
 ## اگر لاگین کار نکرد
 
@@ -133,6 +137,7 @@ A panel opens where you can:
 - Switch language (فارسی / English)
 - Change username, password, check interval, renewal time
 - Test login now, diagnose the portal, view logs
+- Check for updates
 
 **Note on Persian text in the terminal:** Persian renders right-aligned and properly shaped in Windows Terminal. In the old cmd console it may look broken; use Windows Terminal or switch the panel to English.
 
@@ -144,6 +149,9 @@ A panel opens where you can:
 - **Background execution:** Operates without keeping any terminal windows open.
 - **Browser-independent:** Directly interacts with the login endpoint without requiring a browser.
 - **Windows Startup integration:** Launches silently on boot.
+- **System tray icon:** A small icon next to the clock shows the status (green = connected, red = offline); right-click it to log in now, open the panel, or quit.
+- **Notifications:** If login fails several times in a row, Windows lets you know; it also tells you when the connection is back.
+- **Self-update:** The script checks GitHub every few hours and updates itself when a new version is out.
 
 ## If login does not work
 
@@ -200,15 +208,19 @@ Credentials and settings are saved locally in `config.json`:
 **فارسی:**
 
 1. **نصب:** دستور یک‌خطی بالا را در PowerShell بزن و شماره دانشجویی و پسوردت را وارد کن.
-2. **تمام:** از اینجا به بعد اسکریپت خودش در پس‌زمینه کار می‌کند؛ هر وقت اینترنت قطع شود خودش دوباره لاگین می‌کند، و با روشن شدن ویندوز هم خودش اجرا می‌شود.
+2. **تمام:** از اینجا به بعد اسکریپت خودش در پس‌زمینه کار می‌کند و آیکونش کنار ساعت دیده می‌شود (سبز یعنی متصل، قرمز یعنی قطع)؛ هر وقت اینترنت قطع شود خودش دوباره لاگین می‌کند، و با روشن شدن ویندوز هم خودش اجرا می‌شود.
 3. **تنظیمات:** هر وقت خواستی چیزی را عوض کنی، cmd را باز کن و بنویس `autologin` — پنل باز می‌شود (استارتاپ، زبان، پسورد، فاصله‌ی بررسی و...).
 4. **اولین تست:** روی وای‌فای دانشگاه، از داخل پنل «عیب‌یابی» را بزن (یا `python lu_autologin.py --diagnose`) تا مطمئن شوی لاگین جواب می‌دهد.
 5. **اگر کار نکرد:** فایل‌های `autologin.log` و `portal_debug.html` را نگه دار؛ با آن‌ها می‌شود روشِ جاافتاده را اضافه کرد.
 
+**نکته:** اسکریپت هر چند ساعت گیت‌هاب را چک می‌کند و اگر نسخه‌ی جدید آمد، خودش را به‌روز می‌کند؛ برای بررسی دستی هم از پنل گزینه‌ی «بررسی به‌روزرسانی» را بزن.
+
 **English:**
 
 1. **Install:** Run the one-line command above in PowerShell and enter your student ID and password.
-2. **Done:** From here on the script runs by itself in the background — it logs back in whenever the internet drops, and it starts with Windows.
+2. **Done:** From here on the script runs by itself in the background and its icon sits next to the clock (green = connected, red = offline) — it logs back in whenever the internet drops, and it starts with Windows.
 3. **Settings:** Whenever you want to change something, open cmd and type `autologin` — the panel opens (startup, language, password, check interval, and more).
 4. **First test:** On university Wi-Fi, run "Diagnose" from the panel (or `python lu_autologin.py --diagnose`) to make sure login works.
 5. **If it does not work:** Keep `autologin.log` and `portal_debug.html`; they are what is needed to add the missing login method.
+
+**Note:** The script checks GitHub every few hours and updates itself when a new version is out; to check manually, use "Check for updates" in the panel.
