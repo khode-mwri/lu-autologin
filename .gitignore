@@ -4,6 +4,7 @@ config.json
 # Logs & activity
 *.log
 autologin.log
+portal_debug.html
 
 # Python bytecode & cache
 __pycache__/

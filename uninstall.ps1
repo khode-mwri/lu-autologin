@@ -2,7 +2,10 @@
 # Usage: irm https://raw.githubusercontent.com/khode-mwri/lu-autologin/main/uninstall.ps1 | iex
 
 Write-Host "Stopping background service..." -ForegroundColor Yellow
-wmic process where "name='pythonw.exe' and commandline like '%lu_autologin.py%'" call terminate >$null 2>&1
+# NOTE: wmic is removed from newer Windows 11 builds, so use CIM instead.
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'pythonw.exe' -and $_.CommandLine -like '*lu_autologin.py*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 $startupFolder = [System.IO.Path]::Combine($env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
 $startupVbs = Join-Path $startupFolder "lu_autologin.vbs"

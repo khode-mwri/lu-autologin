@@ -3,6 +3,34 @@
 Lorestan University Internet Auto-Login & Session Keep-Alive
 Portal: https://internet.lu.ac.ir/login
 Author: khode-mwri
+
+Multi-strategy login
+--------------------
+The portal is a MikroTik hotspot page, but its exact shape can vary:
+CHAP on or off, chap-id written as a raw byte / octal / hex escape,
+the login form posting to the page URL or to a different action URL,
+plain HTTP or HTTPS. Instead of assuming one shape, this script
+detects what the page actually contains and tries every plausible
+login method until one is *verified* by a real internet check.
+The winning method is remembered in config.json ("strategy") and
+tried first on the next run; if it stops working, the others are
+tried again automatically.
+
+Strategies (tried in this order, remembered winner first):
+  chap-form   - MikroTik CHAP (MD5 of chap-id + password + challenge),
+                POSTed to the login form's action URL.
+  plain-form  - Plain username/password POSTed to the form's action URL.
+  plain-page  - Plain username/password POSTed to the page URL itself.
+  chap-page   - CHAP hash POSTed to the page URL itself.
+  get-login   - Username/password sent as a GET query to the form action.
+
+Usage:
+  python lu_autologin.py               # monitor loop (default)
+  python lu_autologin.py --once        # try to log in once, then exit
+  python lu_autologin.py --diagnose    # fetch the portal, print what was
+                                       # found (forms, CHAP data) and save
+                                       # the HTML to portal_debug.html
+  python lu_autologin.py --strategy chap-form --once   # force one method
 """
 
 import sys
@@ -12,6 +40,7 @@ import time
 import ssl
 import re
 import socket
+import argparse
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -29,12 +58,26 @@ except Exception:
     pass
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+DEFAULT_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "autologin.log")
+DEBUG_HTML_FILE = os.path.join(SCRIPT_DIR, "portal_debug.html")
 
 # Single-instance lock port to prevent duplicate processes
 LOCK_PORT = 47829
 _instance_lock_socket = None
+
+DEFAULT_PORTAL_URLS = [
+    "https://internet.lu.ac.ir/login",
+    "http://internet.lu.ac.ir/login",
+]
+DEFAULT_CONNECTIVITY_URLS = [
+    "http://clients3.google.com/generate_204",
+    "http://detectportal.firefox.com/success.txt",
+    "http://www.msftconnecttest.com/connecttest.txt",
+]
+
+STRATEGY_NAMES = ["chap-form", "plain-form", "plain-page", "chap-page", "get-login"]
+
 
 def ensure_single_instance():
     """Ensure only one instance of the auto-login service runs at a time."""
@@ -47,16 +90,26 @@ def ensure_single_instance():
         sys.exit(0)
 
 
-def load_or_create_config():
-    """Load configuration from config.json, or prompt interactively if missing."""
-    if os.path.exists(CONFIG_FILE):
+def load_config(config_file, interactive=True):
+    """Load configuration, filling in defaults; prompt for credentials if missing."""
+    cfg = {}
+    if os.path.exists(config_file):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(config_file, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-                if cfg.get("username") and cfg.get("password") and cfg["username"] != "YOUR_STUDENT_ID":
-                    return cfg
         except Exception as e:
-            print(f"[ERROR] Failed to read config.json: {e}")
+            print(f"[ERROR] Failed to read {config_file}: {e}")
+
+    cfg.setdefault("check_interval_seconds", 20)
+    cfg.setdefault("proactive_renew_minutes", 110)
+    cfg.setdefault("portal_urls", list(DEFAULT_PORTAL_URLS))
+    cfg.setdefault("connectivity_urls", list(DEFAULT_CONNECTIVITY_URLS))
+
+    if cfg.get("username") and cfg.get("password") and cfg["username"] != "YOUR_STUDENT_ID":
+        return cfg
+
+    if not interactive:
+        return cfg
 
     # If missing or placeholder, prompt user in interactive mode
     print("=" * 65)
@@ -74,21 +127,19 @@ def load_or_create_config():
         print("[ERROR] Username and password cannot be empty.")
         sys.exit(1)
 
-    cfg = {
-        "username": username,
-        "password": password,
-        "check_interval_seconds": 20,
-        "proactive_renew_minutes": 110
-    }
-
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-        print("[OK] Configuration saved successfully to config.json.")
-    except Exception as e:
-        print(f"[ERROR] Could not save config.json: {e}")
-
+    cfg["username"] = username
+    cfg["password"] = password
+    save_config(cfg, config_file)
+    print("[OK] Configuration saved successfully to config.json.")
     return cfg
+
+
+def save_config(cfg, config_file):
+    try:
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[ERROR] Could not save {config_file}: {e}")
 
 
 def log(message, level="INFO"):
@@ -103,7 +154,12 @@ def log(message, level="INFO"):
 
 
 def get_ssl_context():
-    """Create SSL context that permits internal/self-signed university certificates."""
+    """Create SSL context that permits internal/self-signed university certificates.
+
+    NOTE: verification is off on purpose — the university portal uses a
+    self-signed certificate. This only ever talks to the portal host(s)
+    in portal_urls, so the exposure is limited to the campus network.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -150,125 +206,438 @@ def check_internet(test_urls):
     return False
 
 
-def test_university_portal_reachability(opener, urls):
-    """Check if the university portal can be reached."""
-    for url in urls:
+# ---------------------------------------------------------------------------
+# Portal parsing
+# ---------------------------------------------------------------------------
+
+def decode_js_string(s):
+    """Decode a JavaScript string literal body (without surrounding quotes).
+
+    Handles \\xNN (hex), \\NNN (octal), \\n \\r \\t \\\\ \\' \\" and raw
+    bytes. Returns a str whose latin-1 code points are the original bytes,
+    so ``.encode('latin-1')`` recovers the exact byte sequence.
+    """
+    out = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch != '\\' or i + 1 >= len(s):
+            out.append(ch)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt == 'x':
+            hexpart = s[i + 2:i + 4]
+            if len(hexpart) == 2 and all(c in '0123456789abcdefABCDEF' for c in hexpart):
+                out.append(chr(int(hexpart, 16)))
+                i += 4
+                continue
+            out.append('x')
+            i += 2
+            continue
+        if nxt in '01234567':
+            j = i + 1
+            oct_digits = ''
+            while j < len(s) and len(oct_digits) < 3 and s[j] in '01234567':
+                oct_digits += s[j]
+                j += 1
+            out.append(chr(int(oct_digits, 8) & 0xFF))
+            i = j
+            continue
+        simple = {'n': '\n', 'r': '\r', 't': '\t', 'b': '\b', 'f': '\f', 'v': '\v', '0': '\0'}
+        if nxt in simple:
+            out.append(simple[nxt])
+            i += 2
+            continue
+        # \\ \' \" \/ and anything else: the character itself.
+        out.append(nxt)
+        i += 2
+    return ''.join(out)
+
+
+def _scan_hexmd5_args(html):
+    """Find hexMD5(...) calls and return [(chap_id_raw, challenge_raw), ...].
+
+    Scans character by character so escaped quotes and nested parens
+    cannot break the parse. First literal = chap-id, last literal =
+    chap-challenge; whatever sits between them is the password expression.
+    """
+    results = []
+    for m in re.finditer(r'hexMD5\s*\(', html):
+        i = m.end()
+        depth = 1
+        literals = []
+        cur = None
+        quote = None
+        escaped = False
+        while i < len(html) and depth > 0:
+            ch = html[i]
+            if quote is not None:
+                if escaped:
+                    cur += ch
+                    escaped = False
+                elif ch == '\\':
+                    cur += ch
+                    escaped = True
+                elif ch == quote:
+                    literals.append(cur)
+                    cur = None
+                    quote = None
+                else:
+                    cur += ch
+            else:
+                if ch in ('"', "'"):
+                    quote = ch
+                    cur = ""
+                elif ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+            i += 1
+        if len(literals) >= 2:
+            results.append((literals[0], literals[-1]))
+    return results
+
+
+def extract_chap(html):
+    """Extract MikroTik CHAP (chap-id bytes, chap-challenge string).
+
+    Returns (chap_id_bytes, challenge) or (None, None) when the page
+    does not use CHAP. chap-id may be a raw byte, an octal escape
+    (\\001) or a hex escape (\\x01) — all three decode to the same byte.
+    """
+    for chap_raw, chal_raw in _scan_hexmd5_args(html):
+        chap_id = decode_js_string(chap_raw).encode('latin-1')
+        challenge = decode_js_string(chal_raw)
+        if chap_id:
+            if len(chap_id) != 1:
+                log(f"CHAP chap-id decoded to {len(chap_id)} bytes (expected 1); "
+                    "using it as-is, other strategies remain as fallback.", "WARNING")
+            return chap_id, challenge
+
+    # Fallbacks: chap data in hidden inputs or JS variables.
+    chap_m = re.search(
+        r'''chap[-_]?id['"]?\s*[:=]\s*['"]([^'"]+)['"]''', html, re.IGNORECASE)
+    chal_m = re.search(
+        r'''chap[-_]?challenge['"]?\s*[:=]\s*['"]([^'"]+)['"]''', html, re.IGNORECASE)
+    if chap_m and chal_m:
+        chap_id = decode_js_string(chap_m.group(1)).encode('latin-1')
+        challenge = decode_js_string(chal_m.group(1))
+        if chap_id:
+            return chap_id, challenge
+    return None, None
+
+
+def _tag_attr(tag, name, default=None):
+    m = re.search(
+        r'%s\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))' % re.escape(name),
+        tag, re.IGNORECASE)
+    if not m:
+        return default
+    if m.group(2) is not None:
+        return m.group(2)
+    if m.group(3) is not None:
+        return m.group(3)
+    return m.group(4)
+
+
+def parse_forms(html, page_url):
+    """Return [{'action': absolute URL, 'name': str, 'hidden': {k: v}}]."""
+    forms = []
+    for m in re.finditer(r'<form\b([^>]*)>(.*?)</form>', html,
+                         re.IGNORECASE | re.DOTALL):
+        attrs, body = m.group(1), m.group(2)
+        action = _tag_attr(attrs, 'action') or page_url
+        name = _tag_attr(attrs, 'name') or _tag_attr(attrs, 'id') or ''
+        hidden = {}
+        for inp in re.finditer(r'<input\b[^>]*>', body, re.IGNORECASE):
+            tag = inp.group(0)
+            if (_tag_attr(tag, 'type', '') or '').lower() != 'hidden':
+                continue
+            n = _tag_attr(tag, 'name')
+            v = _tag_attr(tag, 'value')
+            if n is not None:
+                hidden[n] = v or ''
+        forms.append({
+            'action': urllib.parse.urljoin(page_url, action),
+            'name': name,
+            'hidden': hidden,
+        })
+    return forms
+
+
+def preferred_form(forms, page_url):
+    """Pick the form a login POST should go to.
+
+    MikroTik serves two forms: 'sendin' (the one actually submitted by
+    its JS) and 'login' (the visible one). Prefer sendin, then login,
+    then any form whose action mentions login, then the first form.
+    """
+    if not forms:
+        return {'action': page_url, 'name': '', 'hidden': {}}
+    for want in ('sendin', 'login'):
+        for f in forms:
+            if f['name'].lower() == want:
+                return f
+    for f in forms:
+        if 'login' in f['action'].lower():
+            return f
+    return forms[0]
+
+
+def fetch_portal(opener, portal_urls):
+    """GET the portal; follow redirects. Returns (final_url, html) or (None, None).
+
+    The HTML is decoded as latin-1 on purpose: a raw chap-id byte is not
+    valid UTF-8, and decoding with errors='ignore' would silently drop
+    it and break CHAP detection. latin-1 maps bytes 1:1, so the byte
+    survives and .encode('latin-1') recovers it exactly.
+    """
+    for url in portal_urls:
         try:
             req = urllib.request.Request(url)
-            with opener.open(req, timeout=5) as resp:
-                html = resp.read().decode('utf-8', errors='ignore')
+            with opener.open(req, timeout=8) as resp:
+                raw = resp.read()
+                html = raw.decode('latin-1')
                 return resp.geturl(), html
-        except Exception:
+        except Exception as e:
+            log(f"Portal {url} unreachable: {e}", "DEBUG")
             continue
     return None, None
 
 
-def extract_form_params(html):
-    """Extract hidden inputs and MikroTik CHAP challenge if present."""
-    params = {}
-    hidden_inputs = re.findall(r'<input[^>]+type=["\']hidden["\'][^>]*>', html, re.IGNORECASE)
-    for inp in hidden_inputs:
-        name_m = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
-        val_m = re.search(r'value=["\']([^"\']*)["\']', inp, re.IGNORECASE)
-        if name_m and val_m:
-            params[name_m.group(1)] = val_m.group(1)
-
-    chap_id = None
-    chap_challenge = None
-    js_chap = re.search(r"hexMD5\s*\(\s*(['\"])(.*?)\1\s*\+\s*.*?\+\s*(['\"])(.*?)\3\s*\)", html)
-    if js_chap:
-        chap_id = js_chap.group(2)
-        chap_challenge = js_chap.group(4)
-
-    return params, chap_id, chap_challenge
+def is_logged_in_page(html, url):
+    low = html.lower()
+    return ("logout" in low
+            or "status" in url.lower()
+            or "you are logged in" in low
+            or "successfully logged in" in low)
 
 
-def perform_login(opener, username, password, portal_urls):
-    """Execute login to internet.lu.ac.ir portal."""
-    log("Connecting to university portal...", "INFO")
-    
-    portal_url, html = test_university_portal_reachability(opener, portal_urls)
-    if not portal_url:
-        log("Cannot reach internet.lu.ac.ir. Ensure you are on University Wi-Fi.", "WARNING")
-        return False
+# ---------------------------------------------------------------------------
+# Login attempts
+# ---------------------------------------------------------------------------
 
-    if "logout" in html.lower() or "status" in portal_url.lower():
-        log("Session is currently active (Already logged in).", "INFO")
-        return True
-
-    params, chap_id, chap_challenge = extract_form_params(html)
-    
-    payload = {
-        "username": username,
-        "password": password,
-    }
-
-    if chap_id and chap_challenge:
-        log("MikroTik CHAP authentication detected. Computing MD5 hash...", "DEBUG")
-        try:
-            if chap_id.startswith("\\"):
-                val = int(chap_id[1:], 8)
-                cid_bytes = bytes([val])
-            else:
-                cid_bytes = chap_id.encode('latin1')
-            pwd_bytes = password.encode('utf-8')
-            chal_bytes = chap_challenge.encode('latin1')
-            payload["password"] = hashlib.md5(cid_bytes + pwd_bytes + chal_bytes).hexdigest()
-        except Exception as e:
-            log(f"CHAP calculation fallback: {e}", "WARNING")
-
-    for k, v in params.items():
-        if k not in payload:
-            payload[k] = v
-
+def _post(opener, url, payload, referer, timeout=10):
     data = urllib.parse.urlencode(payload).encode('utf-8')
-    post_req = urllib.request.Request(
-        portal_url,
-        data=data,
-        headers={
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': portal_url
-        }
-    )
+    req = urllib.request.Request(url, data=data, headers={
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': referer,
+    })
+    with opener.open(req, timeout=timeout) as resp:
+        body = resp.read().decode('utf-8', errors='ignore')
+        return resp.geturl(), body
+
+
+def _get(opener, url, payload, referer, timeout=10):
+    query = urllib.parse.urlencode(payload)
+    full = url + ('&' if '?' in url else '?') + query
+    req = urllib.request.Request(full, headers={'Referer': referer})
+    with opener.open(req, timeout=timeout) as resp:
+        body = resp.read().decode('utf-8', errors='ignore')
+        return resp.geturl(), body
+
+
+def _verify(final_url, body, connectivity_urls):
+    """Classify a login attempt. 'ok' | 'bad-creds' | 'failed'.
+
+    'ok' only when the portal itself reports a session (status/logout
+    page) or a real internet check passes. A previous version returned
+    success on an ambiguous response; that hid real failures.
+    """
+    low = body.lower()
+    bad_markers = ("invalid username", "invalid password", "incorrect password",
+                   "wrong password", "authentication failed", "login failed",
+                   "invalid user", "bad username or password")
+    if any(m in low for m in bad_markers):
+        return 'bad-creds'
+    if "status" in final_url.lower() or "logout" in low:
+        return 'ok'
+    if check_internet(connectivity_urls):
+        return 'ok'
+    return 'failed'
+
+
+def _chap_hash(chap_id, password, challenge):
+    return hashlib.md5(
+        chap_id + password.encode('utf-8') + challenge.encode('latin-1')
+    ).hexdigest()
+
+
+def _attempt(opener, target, payload, method, referer, connectivity_urls):
+    try:
+        if method == 'POST':
+            final_url, body = _post(opener, target, payload, referer)
+        else:
+            final_url, body = _get(opener, target, payload, referer)
+    except Exception as e:
+        log(f"Request to {target} failed: {e}", "DEBUG")
+        return 'failed'
+    return _verify(final_url, body, connectivity_urls)
+
+
+def _strategy_chap_form(opener, info, cfg):
+    chap_id, challenge = info['chap_id'], info['challenge']
+    form = info['form']
+    payload = dict(form['hidden'])
+    payload['username'] = cfg['username']
+    payload['password'] = _chap_hash(chap_id, cfg['password'], challenge)
+    return _attempt(opener, form['action'], payload, 'POST',
+                    info['page_url'], info['connectivity_urls'])
+
+
+def _strategy_plain_form(opener, info, cfg):
+    form = info['form']
+    payload = dict(form['hidden'])
+    payload['username'] = cfg['username']
+    payload['password'] = cfg['password']
+    return _attempt(opener, form['action'], payload, 'POST',
+                    info['page_url'], info['connectivity_urls'])
+
+
+def _strategy_plain_page(opener, info, cfg):
+    form = info['form']
+    payload = dict(form['hidden'])
+    payload['username'] = cfg['username']
+    payload['password'] = cfg['password']
+    return _attempt(opener, info['page_url'], payload, 'POST',
+                    info['page_url'], info['connectivity_urls'])
+
+
+def _strategy_chap_page(opener, info, cfg):
+    chap_id, challenge = info['chap_id'], info['challenge']
+    form = info['form']
+    payload = dict(form['hidden'])
+    payload['username'] = cfg['username']
+    payload['password'] = _chap_hash(chap_id, cfg['password'], challenge)
+    return _attempt(opener, info['page_url'], payload, 'POST',
+                    info['page_url'], info['connectivity_urls'])
+
+
+def _strategy_get_login(opener, info, cfg):
+    form = info['form']
+    payload = dict(form['hidden'])
+    payload['username'] = cfg['username']
+    payload['password'] = cfg['password']
+    return _attempt(opener, form['action'], payload, 'GET',
+                    info['page_url'], info['connectivity_urls'])
+
+
+STRATEGIES = [
+    ("chap-form", _strategy_chap_form),
+    ("plain-form", _strategy_plain_form),
+    ("plain-page", _strategy_plain_page),
+    ("chap-page", _strategy_chap_page),
+    ("get-login", _strategy_get_login),
+]
+
+
+def perform_login(opener, cfg, config_file, force_strategy=None):
+    """Try login strategies until one is verified. Returns (success, strategy)."""
+    portal_urls = cfg.get("portal_urls") or list(DEFAULT_PORTAL_URLS)
+    connectivity_urls = cfg.get("connectivity_urls") or list(DEFAULT_CONNECTIVITY_URLS)
+
+    page_url, html = fetch_portal(opener, portal_urls)
+    if not page_url:
+        log("Cannot reach internet.lu.ac.ir. Ensure you are on University Wi-Fi.", "WARNING")
+        return False, None
+
+    if is_logged_in_page(html, page_url):
+        log("Session is currently active (Already logged in).", "INFO")
+        return True, "already-logged-in"
+
+    forms = parse_forms(html, page_url)
+    form = preferred_form(forms, page_url)
+    chap_id, challenge = extract_chap(html)
+    info = {
+        'page_url': page_url,
+        'form': form,
+        'chap_id': chap_id,
+        'challenge': challenge,
+        'connectivity_urls': connectivity_urls,
+    }
+    log(f"Portal page: {page_url} | forms: {len(forms)} | "
+        f"form action: {form['action']} | CHAP: {'yes' if chap_id else 'no'}", "DEBUG")
+
+    order = list(STRATEGIES)
+    remembered = cfg.get("strategy")
+    if remembered in dict(STRATEGIES):
+        order.sort(key=lambda s: 0 if s[0] == remembered else 1)
+        log(f"Trying remembered strategy first: {remembered}", "DEBUG")
+
+    for name, fn in order:
+        if force_strategy and name != force_strategy:
+            continue
+        if name.startswith("chap") and not chap_id:
+            log(f"Skipping {name}: page does not use CHAP.", "DEBUG")
+            continue
+        log(f"Trying login method: {name} ...", "INFO")
+        result = fn(opener, info, cfg)
+        if result == 'ok':
+            log(f"Login SUCCESSFUL via {name}! Connected to university internet.", "SUCCESS")
+            if cfg.get("strategy") != name:
+                cfg["strategy"] = name
+                save_config(cfg, config_file)
+            return True, name
+        if result == 'bad-creds':
+            log("Login FAILED: Incorrect username or password. "
+                "Check your credentials in config.json.", "ERROR")
+            return False, None
+        log(f"Method {name} did not work, trying the next one...", "INFO")
+
+    log("All login methods failed. Run with --diagnose and check portal_debug.html.", "ERROR")
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# Diagnose mode
+# ---------------------------------------------------------------------------
+
+def diagnose(opener, cfg):
+    portal_urls = cfg.get("portal_urls") or list(DEFAULT_PORTAL_URLS)
+    page_url, html = fetch_portal(opener, portal_urls)
+    if not page_url:
+        print("[DIAGNOSE] Portal unreachable from here. Are you on University Wi-Fi?")
+        print("[DIAGNOSE] Tried: " + ", ".join(portal_urls))
+        return 1
 
     try:
-        with opener.open(post_req, timeout=8) as resp:
-            resp_body = resp.read().decode('utf-8', errors='ignore')
-            final_url = resp.geturl()
-
-            if "status" in final_url or "logout" in resp_body.lower() or "connected" in resp_body.lower():
-                log("Login SUCCESSFUL! Connected to university internet.", "SUCCESS")
-                return True
-            elif "invalid" in resp_body.lower() or "incorrect" in resp_body.lower() or "wrong" in resp_body.lower():
-                log("Login FAILED: Incorrect username or password.", "ERROR")
-                return False
-            else:
-                time.sleep(1)
-                if check_internet(["http://clients3.google.com/generate_204"]):
-                    log("Login confirmed! Internet access is verified.", "SUCCESS")
-                    return True
-                log("Login request sent, awaiting network confirmation...", "INFO")
-                return True
+        with open(DEBUG_HTML_FILE, "w", encoding="utf-8", errors="replace") as f:
+            f.write(html)
+        print(f"[DIAGNOSE] Saved portal HTML to {DEBUG_HTML_FILE}")
     except Exception as e:
-        log(f"Network error during login request: {e}", "ERROR")
-        return False
+        print(f"[DIAGNOSE] Could not save HTML: {e}")
+
+    forms = parse_forms(html, page_url)
+    form = preferred_form(forms, page_url)
+    chap_id, challenge = extract_chap(html)
+
+    print(f"[DIAGNOSE] Final URL   : {page_url}")
+    print(f"[DIAGNOSE] Already in : {'yes' if is_logged_in_page(html, page_url) else 'no'}")
+    print(f"[DIAGNOSE] Forms found: {len(forms)}")
+    for i, f in enumerate(forms):
+        print(f"[DIAGNOSE]   form {i}: name={f['name']!r} action={f['action']!r} hidden={f['hidden']!r}")
+    print(f"[DIAGNOSE] Preferred form action: {form['action']}")
+    if chap_id:
+        print(f"[DIAGNOSE] CHAP detected: chap-id={chap_id!r} challenge={challenge!r}")
+    else:
+        print("[DIAGNOSE] CHAP not detected: plain username/password login expected.")
+    print("[DIAGNOSE] Strategies that would be tried: " +
+          ", ".join(n for n, _ in STRATEGIES))
+    return 0
 
 
-def run_monitor():
-    ensure_single_instance()
+# ---------------------------------------------------------------------------
+# Monitor loop
+# ---------------------------------------------------------------------------
 
-    cfg = load_or_create_config()
+def run_monitor(cfg, config_file, once=False, force_strategy=None):
     username = cfg["username"]
     password = cfg["password"]
     check_interval = int(cfg.get("check_interval_seconds", 20))
     proactive_seconds = int(cfg.get("proactive_renew_minutes", 110)) * 60
 
-    portal_urls = ["https://internet.lu.ac.ir/login", "http://internet.lu.ac.ir/login"]
-    connectivity_urls = [
-        "http://clients3.google.com/generate_204",
-        "http://detectportal.firefox.com/success.txt",
-        "http://www.msftconnecttest.com/connecttest.txt"
-    ]
+    portal_urls = cfg.get("portal_urls") or list(DEFAULT_PORTAL_URLS)
 
     print("=" * 65)
     print("  LORESTAN UNIVERSITY (LU) INTERNET AUTO-LOGIN SERVICE")
@@ -277,9 +646,12 @@ def run_monitor():
     log(f"Target Portal       : {portal_urls[0]}", "INFO")
     log(f"Check Frequency     : Every {check_interval} seconds", "INFO")
     log(f"Proactive Renewal   : Every {proactive_seconds // 60} minutes", "INFO")
+    if cfg.get("strategy"):
+        log(f"Preferred Method    : {cfg['strategy']} (remembered)", "INFO")
     print("=" * 65)
 
     opener = create_session()
+    connectivity_urls = cfg.get("connectivity_urls") or list(DEFAULT_CONNECTIVITY_URLS)
     last_login_time = 0
 
     if check_internet(connectivity_urls):
@@ -287,8 +659,12 @@ def run_monitor():
         last_login_time = time.time()
     else:
         log("Internet is DOWN. Attempting initial login...", "WARNING")
-        if perform_login(opener, username, password, portal_urls):
+        ok, _ = perform_login(opener, cfg, config_file, force_strategy)
+        if ok:
             last_login_time = time.time()
+
+    if once:
+        return 0 if last_login_time > 0 else 1
 
     while True:
         try:
@@ -297,13 +673,13 @@ def run_monitor():
 
             if last_login_time > 0 and (now - last_login_time) >= proactive_seconds:
                 log("Proactive session renewal window reached. Refreshing session...", "INFO")
-                if perform_login(opener, username, password, portal_urls):
+                if perform_login(opener, cfg, config_file, force_strategy)[0]:
                     last_login_time = now
                 continue
 
             if not check_internet(connectivity_urls):
                 log("Internet disconnected! Reconnecting...", "WARNING")
-                if perform_login(opener, username, password, portal_urls):
+                if perform_login(opener, cfg, config_file, force_strategy)[0]:
                     last_login_time = now
                     log("Connection restored successfully.", "SUCCESS")
                 else:
@@ -315,7 +691,40 @@ def run_monitor():
         except Exception as ex:
             log(f"Unexpected error: {ex}", "ERROR")
             time.sleep(5)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Lorestan University internet auto-login (multi-strategy).")
+    parser.add_argument("--once", action="store_true",
+                        help="Try to log in once, then exit (exit 0 on success).")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Fetch the portal, print detected forms/CHAP data, "
+                             "save the HTML to portal_debug.html, then exit.")
+    parser.add_argument("--strategy", choices=[n for n, _ in STRATEGIES],
+                        help="Force a single login method (for testing).")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_FILE,
+                        help="Path to config.json (default: next to the script).")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config, interactive=not args.diagnose)
+    opener = create_session()
+
+    if args.diagnose:
+        return diagnose(opener, cfg)
+
+    if not cfg.get("username") or not cfg.get("password"):
+        print("[ERROR] No credentials configured. Run once without --diagnose "
+              "to enter them, or fill in config.json.")
+        return 1
+
+    if not args.once:
+        ensure_single_instance()
+
+    return run_monitor(cfg, args.config, once=args.once,
+                       force_strategy=args.strategy)
 
 
 if __name__ == "__main__":
-    run_monitor()
+    sys.exit(main())

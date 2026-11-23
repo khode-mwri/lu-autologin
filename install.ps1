@@ -44,7 +44,7 @@ if ([string]::IsNullOrWhiteSpace($plainPassword)) {
 # 4. Fetch latest project files from GitHub
 Write-Host "`nDownloading latest files from repository..." -ForegroundColor Cyan
 $baseUrl = "https://raw.githubusercontent.com/khode-mwri/lu-autologin/main"
-$files = @("lu_autologin.py", "run.bat", "run_background.bat", "stop_background.bat", "enable_startup.bat", "disable_startup.bat", "view_logs.bat", "README.md")
+$files = @("lu_autologin.py", "run.bat", "run_background.bat", "stop_background.bat", "enable_startup.bat", "disable_startup.bat", "view_logs.bat", "setup.bat", "launch_silent.vbs", "README.md")
 
 foreach ($f in $files) {
     $url = "$baseUrl/$f"
@@ -73,7 +73,10 @@ $vbsContent = "Set WshShell = CreateObject(`"WScript.Shell`")`nWshShell.Run `"py
 [System.IO.File]::WriteAllText($startupVbs, $vbsContent, [System.Text.Encoding]::ASCII)
 
 # 7. Stop any older instance & start background service
-wmic process where "name='pythonw.exe' and commandline like '%lu_autologin.py%'" call terminate >$null 2>&1
+# NOTE: wmic is removed from newer Windows 11 builds, so use CIM instead.
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'pythonw.exe' -and $_.CommandLine -like '*lu_autologin.py*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 400
 
 Start-Process "pythonw.exe" -ArgumentList "`"$installDir\lu_autologin.py`"" -WindowStyle Hidden

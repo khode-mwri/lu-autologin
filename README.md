@@ -22,9 +22,27 @@ irm https://raw.githubusercontent.com/khode-mwri/lu-autologin/main/uninstall.ps1
 ## Highlights
 - **Automatic Reconnection**: Detects when connectivity drops and logs back in.
 - **Proactive Session Renewal**: Renews the session before the university's 2-hour timeout.
+- **Multi-Strategy Login**: The portal's exact shape can vary (CHAP on/off, chap-id as raw byte / octal / hex escape, form posting to the page or to a different URL, HTTP/HTTPS). The script detects what the page actually contains and tries every plausible method — CHAP form POST, plain form POST, plain page POST, CHAP page POST, GET login — until one is **verified** by a real internet check. The winning method is remembered in `config.json` and tried first next time.
 - **Background Execution**: Operates without keeping any terminal windows open.
 - **Browser-Independent**: Directly interacts with the login endpoint without requiring a browser.
 - **Windows Startup Integration**: Launches silently on boot.
+
+## If login does not work
+
+Run the diagnose mode once while on university Wi-Fi — it fetches the portal, prints the forms and CHAP data it found, and saves the page to `portal_debug.html`:
+
+```powershell
+python lu_autologin.py --diagnose
+```
+
+Other useful modes:
+
+```powershell
+python lu_autologin.py --once                        # try once, then exit
+python lu_autologin.py --once --strategy chap-form   # force one method
+```
+
+If every method fails, the log (`autologin.log`) and `portal_debug.html` show exactly what the portal returned — that is what is needed to add the missing method. A test suite (`tests/`) verifies all login methods against a mock MikroTik portal; run it with `python tests/run_strategy_tests.py`.
 
 ## Manual Usage Scripts
 Located in `$HOME\LU_AutoLogin` after install:
@@ -42,7 +60,9 @@ Credentials and settings are saved locally in `config.json`:
   "username": "YOUR_STUDENT_ID",
   "password": "YOUR_PASSWORD",
   "check_interval_seconds": 20,
-  "proactive_renew_minutes": 110
+  "proactive_renew_minutes": 110,
+  "portal_urls": ["https://internet.lu.ac.ir/login", "http://internet.lu.ac.ir/login"],
+  "connectivity_urls": ["http://clients3.google.com/generate_204", "http://detectportal.firefox.com/success.txt", "http://www.msftconnecttest.com/connecttest.txt"]
 }
 ```
-*Note: `config.json` is strictly ignored by git to protect personal credentials.*
+*Note: `config.json` is strictly ignored by git to protect personal credentials. The script also remembers the login method that worked (`"strategy"`) in `config.json` and tries it first next time.*
